@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.13;
+pragma solidity ^0.8;
 
 import {ISuperfluid, ISuperToken, ISuperApp, ISuperAgreement, SuperAppDefinitions} from "@superfluid-finance/ethereum-contracts/contracts/interfaces/superfluid/ISuperfluid.sol"; 
 
@@ -29,20 +29,22 @@ contract Bond is SuperAppBase {
     
 
     //variables for bond logic
-    uint256 private _fundingTarget; //the amount in wei the borrower wants to raise from the bond
-    uint256 private _amountRaised; // wei actually raised at the end of the campaign
-    uint256 private _fundingRate; //interest per year in basis points
-    uint256 private _loanTerm; //length of loan, days
+    int96 private _fundingTarget; //the amount in wei the borrower wants to raise from the bond
+    int96 private _amountRaised; // wei actually raised at the end of the campaign
+    int96 private _fundingRate; //interest per year in basis points
+    int96 private _loanTerm; //length of loan, days
     address public borrower;
-    int96 _initialBorrowerFlowRate;
-    mapping (address => uint256) private lenderContributions; //wei, keeps track of how much each investor put in
+    address private _admin;
+    int96 _currentBorrowerFlowRate;
+    mapping (address => int96) private lenderContributions; //wei, keeps track of how much each investor put in
     mapping (address => bool) private lenderExists;
     address[] private lenderAddresses;
-    mapping (address => uint256) private lenderFlowRate; //wei
-    uint256 public constant secondsPerYear = 31536000;
+    mapping (address => int96) private lenderFlowRate; //wei
+    int96 public constant secondsPerYear = 31536000;
     bool private investorFlowRatesSet; 
-    bool private borrowerHasLoan;
+    bool private borrowerHasLoan = false;
     bool private initialSetup;
+    //bool private isClosed = false;
 
 
     constructor(
@@ -50,9 +52,10 @@ contract Bond is SuperAppBase {
         IConstantFlowAgreementV1 cfa,
         ISuperToken acceptedToken,
         //address receiver
-        uint256 fundingTarget, //in wei
-        uint256 fundingRate, //basis points
-        uint256 loanTerm //length of loan, days
+        int96 fundingTarget, //in wei
+        int96 fundingRate, //basis points
+        int96 loanTerm, //length of loan, days
+        address admin
     ) {
         require(address(host) != address(0), "host is zero address");
         require(address(cfa) != address(0), "cfa is zero address");
@@ -78,6 +81,7 @@ contract Bond is SuperAppBase {
         _fundingTarget = fundingTarget;
         _fundingRate = fundingRate;
         _loanTerm = loanTerm;
+        _admin = admin;
         borrower = msg.sender; //borrower will deploy the contract
         initialSetup = true;
         cfaV1 = CFAv1Library.InitData(_host, _cfa);
@@ -95,17 +99,17 @@ contract Bond is SuperAppBase {
      *************************************************************************/
 
 /// @dev helper to calc each investors flow rate, wei/second
-    function _calcInvestorFlowRate(address investorAddress) private returns (uint256 flowRate) {
+    function _calcInvestorFlowRate(address investorAddress) view private returns (int96 flowRate) {
     
     ///// THIS IS NOT RIGHT< SHOULD BE ABLE TO DEAL WITH A SITUATION WHERE BORROWER UPDATES FLOW
 
-    uint256 totalInterestPerYearWei = (_amountRaised * _fundingRate) / 10000;  //wei
-    uint256 totalPrincipalPerYearWei = (_amountRaised * 365) / _loanTerm; //wei
-    uint256 totalRepaymentPerYearWei = totalInterestPerYearWei + totalPrincipalPerYearWei; //wei
+    int96 totalInterestPerYearWei = (_amountRaised * _fundingRate) / 10000;  //wei
+    int96 totalPrincipalPerYearWei = (_amountRaised * 365) / _loanTerm; //wei
+    int96 totalRepaymentPerYearWei = totalInterestPerYearWei + totalPrincipalPerYearWei; //wei
     
     //does the contract still have eth in? ************************************?????!??
-    uint256 totalInvestorCFPerYearWei = (lenderContributions[investorAddress] * totalRepaymentPerYearWei) / _amountRaised;
-    uint256 totalInvestorCFPerSecondWei = totalInvestorCFPerYearWei / secondsPerYear; 
+    int96 totalInvestorCFPerYearWei = (lenderContributions[investorAddress] * totalRepaymentPerYearWei) / _amountRaised;
+    int96 totalInvestorCFPerSecondWei = totalInvestorCFPerYearWei / secondsPerYear; 
     flowRate = totalInvestorCFPerSecondWei;
     }
 
@@ -119,13 +123,13 @@ contract Bond is SuperAppBase {
     function _transferAllFundsToBorrower() private {
         require(address(this).balance > 0, "contract is empty");
         
-        _amountRaised = address(this).balance;
+        _amountRaised = int96(int(address(this).balance));
         //if not empty and loan is not transferred yet, transfer it
-        (bool sent, bytes memory data) = borrower.call{value: address(this).balance}("");
+        (bool sent, ) = borrower.call{value: address(this).balance}("");
         require(sent, "Failed to send Ether to Borrower");
         
-        (, int96  initialBorrowerFlowRate, , ) = _cfa.getFlow(_acceptedToken, address(this), borrower);
-         _initialBorrowerFlowRate = initialBorrowerFlowRate;
+        (, int96  currentBorrowerFlowRate, , ) = _cfa.getFlow(_acceptedToken, address(this), borrower);
+         _currentBorrowerFlowRate = currentBorrowerFlowRate;
     }
 
 /// @dev will be called when investors send eth to the contract since there is no receive()
@@ -135,7 +139,7 @@ contract Bond is SuperAppBase {
 
     receive() external payable {
          //store the amount sent. Can handle situation where same user sends more than once 
-        lenderContributions[msg.sender] = lenderContributions[msg.sender] + msg.value;
+        lenderContributions[msg.sender] = lenderContributions[msg.sender] + int96(int(msg.value));
         
         //add investor to the register of lenders if not already there
         if (!lenderExists[msg.sender]) {
@@ -158,13 +162,13 @@ contract Bond is SuperAppBase {
         private
         returns (bytes memory newCtx)
     {
-        int96 contractNetFlowRate = _cfa.getNetFlow(_acceptedToken,address(this)); 
+        //int96 contractNetFlowRate = _cfa.getNetFlow(_acceptedToken,address(this)); 
         (, int96 newBorrowerFlowRate, , ) = _cfa.getFlow(_acceptedToken,address(this),borrower);
         newCtx = ctx;
         uint256 numOfInvestors = lenderAddresses.length;
         
         if (initialSetup == true) { 
-            uint256 outFlowRate;
+            int96 outFlowRate;
             //loop through the investors and create a new CFA flow for each of them
             for (uint256 i = 1; i <= numOfInvestors; i++) {
                 //create a new CFA 
@@ -190,7 +194,7 @@ contract Bond is SuperAppBase {
             }
         } else { //flows have been updated
 
-            if (newBorrowerFlowRate != _initialBorrowerFlowRate ) { //borrower CFA has been updated
+            if (newBorrowerFlowRate != _currentBorrowerFlowRate ) { //borrower CFA has been updated
 
                 //update all investor flow rates
                 _setAllInvestorFlowRates();
@@ -206,6 +210,8 @@ contract Bond is SuperAppBase {
                 }
             }
         }
+
+
 
     }
 
@@ -291,6 +297,25 @@ contract Bond is SuperAppBase {
     modifier onlyExpected(ISuperToken superToken, address agreementClass) {
         require(_isSameToken(superToken), "RedirectAll: not accepted token");
         require(_isCFAv1(agreementClass), "RedirectAll: only CFAv1 supported");
+        _;
+    }
+
+        /**
+     * @dev Returns the address of the current owner.
+     */
+    function admin() public view virtual returns (address) {
+        return _admin;
+    }
+
+    function setAdmin(address newAdmin) public onlyAdmin {
+        _admin = newAdmin;
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyAdmin() {
+        require(admin() == msg.sender, "caller is not the admin");
         _;
     }
 

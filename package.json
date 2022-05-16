@@ -13,6 +13,8 @@
   "license": "ISC",
   "dependencies": {
     "@openzeppelin/contracts": "^4.6.0",
-    "@superfluid-finance/ethereum-contracts": "^1.2.2"
+    "@superfluid-finance/ethereum-contracts": "^1.2.2",
+    "@truffle/hdwallet-provider": "^2.0.8",
+    "dotenv": "^16.0.1"
   }
 }
